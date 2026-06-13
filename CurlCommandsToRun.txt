@@ -1,0 +1,333 @@
+Step 1: Initialize the Environment & Start the Services
+Open Git Bash in the project root directory.
+
+Copy the environment configuration file:
+
+
+cp .env.example .env
+
+Start the database and application containers in the background:
+
+
+docker-compose up --build -d
+
+Check the application server health: Run this until it returns a 200 OK response showing healthy:
+
+
+curl -i http://localhost:8080/health
+
+Step 2: Test Command & Query Functionalities (Step-by-Step)
+Here are the curl commands to test each core business flow. To make it dynamic and easy to copy-paste, we define Git Bash variables at the start.
+
+Define test variables in Git Bash:
+
+
+BASE_URL="http://localhost:8080"
+ACC_ID="acc-bash-999"
+
+1. Create a New Account
+Create an account with a $0.00 initial balance:
+
+
+curl -i -X POST "$BASE_URL/api/accounts" \
+  -H "Content-Type: application/json" \
+  -d "{\"accountId\": \"$ACC_ID\", \"ownerName\": \"Alice Smith\", \"initialBalance\": 0, \"currency\": \"USD\"}"
+
+
+Expected Response: 202 Accepted
+Verify Duplicate Account Creation Constraint:
+Try to run the same command again. It should fail:
+
+curl -i -X POST "$BASE_URL/api/accounts" \
+  -H "Content-Type: application/json" \
+  -d "{\"accountId\": \"$ACC_ID\", \"ownerName\": \"Alice Smith\", \"initialBalance\": 0, \"currency\": \"USD\"}"
+
+
+Expected Response: 409 Conflict (Account already exists)
+2. Get Current Account Summary (Read Model Projection)
+Retrieve the read model projection for the newly created account:
+
+curl -s "$BASE_URL/api/accounts/$ACC_ID"
+
+
+Expected Response:
+
+{"accountId":"acc-bash-999","ownerName":"Alice Smith","balance":0,"currency":"USD","status":"OPEN"}
+
+3. Deposit Money & Idempotency Check
+Deposit $150.00:
+
+TX_DEP_1="tx-bash-dep-101"
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/deposit" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 150.00, \"description\": \"Monthly Paycheck\", \"transactionId\": \"$TX_DEP_1\"}"
+
+
+Expected Response: 202 Accepted
+Test Idempotency:
+Send the same transaction again. It should return a success code but not record it twice:
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/deposit" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 150.00, \"description\": \"Monthly Paycheck\", \"transactionId\": \"$TX_DEP_1\"}"
+
+
+Expected Response: 202 Accepted (Deposit already processed (idempotent))
+Verify Updated Balance:
+
+
+curl -s "$BASE_URL/api/accounts/$ACC_ID"
+
+
+Expected Response: {"balance":150} (or 150.00)
+4. Withdraw Money & Insufficient Funds Check
+Withdraw $50.00:
+
+
+TX_WITH_1="tx-bash-with-201"
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/withdraw" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 50.00, \"description\": \"ATM Withdrawal\", \"transactionId\": \"$TX_WITH_1\"}"
+
+
+Expected Response: 202 Accepted
+Verify Updated Balance:
+
+
+curl -s "$BASE_URL/api/accounts/$ACC_ID"
+
+
+Expected Response: {"balance":100}
+Test Insufficient Funds constraint:
+Try to withdraw $500.00 when the balance is only $100.00:
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/withdraw" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 500.00, \"description\": \"Rent Payment\", \"transactionId\": \"tx-bash-fail\"}"
+
+
+Expected Response: 409 Conflict (Insufficient funds)
+5. Close Account Constraints
+Test: Close Account while balance is non-zero (fails):
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/close" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Moving banks"}'
+
+
+Expected Response: 409 Conflict (Account balance must be zero to close)
+Withdraw Remaining Funds:
+Withdraw the remaining $100.00 to empty the account:
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/withdraw" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 100.00, \"description\": \"Clear balance\", \"transactionId\": \"tx-bash-clear\"}"
+
+
+Expected Response: 202 Accepted
+Close the Account:
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/close" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Moving banks"}'
+
+
+Expected Response: 202 Accepted
+Verify Account is Closed:
+
+
+curl -s "$BASE_URL/api/accounts/$ACC_ID"
+Expected Response: {"status":"CLOSED"}
+Test: Deposit to a closed account (fails):
+
+
+curl -i -X POST "$BASE_URL/api/accounts/$ACC_ID/deposit" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 50.00, \"description\": \"Late deposit\", \"transactionId\": \"tx-bash-closed-fail\"}"
+
+
+Expected Response: 409 Conflict (Account is closed)
+Step 3: Test Advanced Functionality
+Let's set up a new active account for testing time-travel and pagination.
+
+
+TT_ACC="acc-bash-time-travel"
+curl -s -X POST "$BASE_URL/api/accounts" \
+  -H "Content-Type: application/json" \
+  -d "{\"accountId\": \"$TT_ACC\", \"ownerName\": \"Marty McFly\", \"initialBalance\": 0, \"currency\": \"USD\"}"
+
+
+1. Time Travel Balance Query
+Let's capture state at a point in time, make changes, and query the past state.
+
+Capture starting timestamp (T0):
+
+
+T0=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "T0 Timestamp: $T0"
+sleep 1
+
+
+Deposit $100.00:
+
+curl -s -X POST "$BASE_URL/api/accounts/$TT_ACC/deposit" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 100.00, \"description\": \"First deposit\", \"transactionId\": \"tt-tx-1\"}"
+
+
+Capture intermediate timestamp (T1):
+
+
+sleep 1
+T1=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "T1 Timestamp: $T1"
+sleep 1
+
+
+Deposit another $50.00:
+
+
+curl -s -X POST "$BASE_URL/api/accounts/$TT_ACC/deposit" \
+  -H "Content-Type: application/json" \
+  -d "{\"amount\": 50.00, \"description\": \"Second deposit\", \"transactionId\": \"tt-tx-2\"}"
+sleep 1
+
+
+Query current state (should be $150.00):
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC"
+
+
+Query Time-Travel balance at T1 (should reconstruct to exactly $100.00):
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC/balance-at/$T1"
+
+Expected Response: {"accountId":"acc-bash-time-travel","balanceAt":100,"timestamp":"2026-06-...Z"}
+Query Time-Travel balance at T0 (should reconstruct to exactly $0.00):
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC/balance-at/$T0"
+
+
+Expected Response: {"balanceAt":0}
+2. Get Paginated Transaction History
+Retrieve the paginated transactions for the time travel account:
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC/transactions?page=1&pageSize=10"
+
+
+Expected Response: A JSON containing count info and transaction list:
+{
+  "currentPage": 1,
+  "pageSize": 10,
+  "totalPages": 1,
+  "totalCount": 2,
+  "items": [
+    {
+      "transactionId": "tt-tx-2",
+      "type": "DEPOSIT",
+      "amount": 50,
+      "description": "Second deposit",
+      "timestamp": "2026-06-...Z"
+    },
+    {
+      "transactionId": "tt-tx-1",
+      "type": "DEPOSIT",
+      "amount": 100,
+      "description": "First deposit",
+      "timestamp": "2026-06-...Z"
+    }
+  ]
+}
+
+
+3. View Event Stream
+To audit the aggregate from the write model, view the raw event store stream:
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC/events"
+
+
+4. Rebuild Projections (CQRS Resynchronization)
+Trigger a full projection rebuild which clears projection tables and replays events:
+
+
+curl -i -X POST "$BASE_URL/api/projections/rebuild"
+
+
+Expected Response: 202 Accepted (Projection rebuild initiated.)
+Verify if read-side model is restored successfully by querying:
+
+
+curl -s "$BASE_URL/api/accounts/$TT_ACC"
+
+
+5. Check Projection Lags and Status
+Query the status and lags of all projection processors:
+
+
+curl -s "$BASE_URL/api/projections/status"
+
+Expected Response:
+
+{
+  "totalEventsInStore": 5,
+  "projections": [
+    {
+      "name": "AccountSummaries",
+      "lastProcessedEventNumberGlobal": 5,
+      "lag": 0
+    },
+    {
+      "name": "TransactionHistory",
+      "lastProcessedEventNumberGlobal": 5,
+      "lag": 0
+    }
+  ]
+}
+
+
+6. Snapshotting Trigger (Automatic Optimization)
+Snapshots optimize account state loading. When an aggregate accumulates 51 events, a snapshot is created. Let's create an account and push it to 51 events.
+
+Create snapshot testing account:
+
+
+SNAP_ACC="acc-bash-snapshot"
+curl -s -X POST "$BASE_URL/api/accounts" \
+  -H "Content-Type: application/json" \
+  -d "{\"accountId\": \"$SNAP_ACC\", \"ownerName\": \"Mr. Snapshot\", \"initialBalance\": 0, \"currency\": \"USD\"}"
+
+
+Send 50 deposit commands sequentially (to hit exactly 51 events including creation):
+
+
+for i in {1..50}
+do
+  curl -s -o /dev/null -w "Deposit #$i status: %{http_code}\n" -X POST "$BASE_URL/api/accounts/$SNAP_ACC/deposit" \
+    -H "Content-Type: application/json" \
+    -d "{\"amount\": 1.00, \"description\": \"Micro savings\", \"transactionId\": \"snap-tx-$i\"}"
+done
+
+
+Check the projection status to confirm the events processing:
+
+
+curl -s "$BASE_URL/api/projections/status"
+
+
+(Behind the scenes, the snapshot table will now contain the consolidated state at event 51, ensuring that subsequent loads only read the snapshot and any newer events).
+
+Step 4: Tear Down
+When you are done testing, tear down the docker containers:
+
+
+docker-compose down
