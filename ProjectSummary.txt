@@ -1,0 +1,100 @@
+1. Project Purpose & Overview
+
+The Bank Account Management System is a financial API designed to demonstrate Event Sourcing and CQRS (Command Query Responsibility Segregation) patterns.
+
+In a traditional database design, if you deposit money, the database overwrites the balance field (e.g., changing $100 to $150). However, you lose the historical context of how that balance was reached. This project solves that by storing actions, not just final states.
+
+The Write Store (Event Store) is an append-only log of every state change (e.g., AccountCreated, MoneyDeposited, MoneyWithdrawn, AccountClosed).
+The Read Projections are read-optimized database tables generated from the event store to allow fast, direct queries for balances and transaction histories.
+
+
+2. Key Architecture Design
+Event Sourcing (ES)
+
+Events are the single source of truth. Every command that updates state generates a new immutable event. The current state of any bank account is derived dynamically by fetching the latest state snapshot and replaying all subsequent events in chronological order.
+
+CQRS (Command Query Responsibility Segregation)
+This pattern separates the write operations (Commands) from the read operations (Queries):
+
+Write Side (Commands): 
+Validates business invariants, updates the event log, and returns a 202 Accepted status.
+
+Read Side (Queries): 
+An asynchronous projection process monitors the event log, updating structured read-only tables (account_summaries, transaction_history) so queries are instant and don't require replaying events on every user request.
+
+
+3. How Each Functionality is Implemented
+
+1. Create Account (POST /api/accounts)
+Implementation:
+The API validates the request schema and queries the event store to ensure the accountId doesn't already exist.
+It appends an AccountCreated event into the database events table inside a transaction.
+The projection listener catches this event and inserts a new row with status OPEN and the initial balance in the account_summaries projection.
+
+2. Deposit Money (POST /api/accounts/:accountId/deposit)
+Implementation:
+The API loads the account's state by fetching its snapshot and replaying subsequent events.
+It validates business constraints: the account must be OPEN and exist.
+It verifies Idempotency: checks if the command's transactionId exists in the state's processedTransactionIds. If yes, it returns 202 immediately without doing anything.
+If new, it appends a MoneyDeposited event.
+The projection listener processes the event: updates the balance in account_summaries and inserts a record in transaction_history.
+
+3. Withdraw Money (POST /api/accounts/:accountId/withdraw)
+Implementation:
+Loads current state (snapshot + replayed events).
+Validates business constraints: account status must be OPEN, and the account balance must be greater than or equal to the withdrawal amount.
+Performs an idempotency check on transactionId.
+Appends a MoneyWithdrawn event.
+The projection updates the read model by subtracting the balance in account_summaries and inserting a WITHDRAWAL record into transaction_history.
+
+4. Close Account (POST /api/accounts/:accountId/close)
+Implementation:
+Loads current state.
+Validates that the account is currently OPEN and its balance is exactly $0.00 (accounts with funds cannot be closed).
+Appends an AccountClosed event.
+The projection updates the status column in account_summaries to CLOSED.
+
+5. Get Current Account Summary (GET /api/accounts/:accountId)
+Implementation:
+Instead of rebuilding the account state from events (which is CPU intensive), it directly performs a simple SELECT query on the account_summaries table. This provides sub-millisecond retrieval times.
+
+6. Get Paginated Transaction History (GET /api/accounts/:accountId/transactions)
+Implementation:
+Directly queries the transaction_history table using SQL LIMIT and OFFSET clauses, returning pages of transaction logs sorted by timestamp.
+
+7. Time-Travel Query (GET /api/accounts/:accountId/balance-at/:timestamp)
+Implementation:
+The system ignores snapshots.
+It queries the events table for all events related to the target accountId that were recorded on or before the specified ISO-8601 timestamp (timestamp <= target_date).
+It replays these events sequentially starting from a zero balance, allowing it to reconstruct what the balance was at that exact microsecond in the past.
+
+8. Rebuild Projections (POST /api/projections/rebuild)
+Implementation:
+Truncates account_summaries and transaction_history projection tables.
+Resets the projection tracking pointer in projection_status to 0.
+A background process restarts the event replay loop, reading all events from the events table chronologically to reconstruct the read models from scratch.
+
+9. Snapshotting Strategy (Automatic Optimization)
+Implementation:
+Replaying thousands of events to load an account's state would eventually degrade performance.
+The system monitors the event number. Upon writing the 51st event (and every subsequent 50th event, e.g. 101st, 151st), it automatically serializes the full JavaScript state of the account and saves it in the snapshots table.
+When loading the account, it queries the snapshot first, sets the state, and only queries/replays events with event_number > snapshot.last_event_number.
+
+
+4. How the Technology Stack Helps
+Node.js & Express:
+Provides a highly performant, non-blocking asynchronous event loop which is perfect for processing HTTP API commands and notifying projections asynchronously without blocking the user thread.
+
+TypeScript:
+Ensures design-time and compile-time type safety. It prevents typos in event payloads (e.g., passing ammount instead of amount) and models the complex domain states of the aggregate safely.
+
+PostgreSQL:
+Transactions (ACID): Critical for appending events and checking version numbers atomically. If a concurrent write conflict occurs (Optimistic Concurrency Control), Postgres rolls back the transaction, preserving aggregate integrity.
+
+JSONB Type: Postgres natively supports indexing and querying JSON columns. The event_data field uses JSONB, enabling different events to store completely different schemas (e.g., initialBalance for creation vs amount/description for transactions) in a single unified table.
+
+Docker & Docker Compose:
+Guarantees that the exact environment runs identically on all machines (handles database setups, health checks, ports, and environment variables) without manual system configuration.
+
+UUID Library:
+Generates globally unique identifiers for events and transaction checks, guaranteeing that distributed operations have unique keys and cannot collide.
